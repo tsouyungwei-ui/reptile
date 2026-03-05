@@ -31,6 +31,7 @@ import time
 import random
 import argparse
 import logging
+import requests
 import pandas as pd
 from datetime import datetime
 
@@ -91,7 +92,8 @@ def build_quarter_list(start_year: int, end_year: int) -> list[tuple[int, int]]:
 
 def download_quarter(stock_id: str, ce_year: int, season: int,
                      market_type: str, tracker: ProgressTracker,
-                     retry_failed: bool = False) -> str:
+                     retry_failed: bool = False,
+                     session: requests.Session = None) -> str:
     """
     下載單一季度的完整財報 PDF。
     回傳狀態字串：
@@ -109,7 +111,7 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
         return 'noop'
 
     # ── 實際下載 ──────────────────────────────────────────────
-    result = PdfDownloader.download(stock_id, ce_year, season, market_type)
+    result = PdfDownloader.download(stock_id, ce_year, season, market_type, session=session)
 
     if result:
         tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'DONE')
@@ -124,13 +126,16 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
 
 def download_company(stock_id: str, start_year: int, end_year: int,
                      market_type: str, tracker: ProgressTracker,
-                     retry_failed: bool = False):
+                     retry_failed: bool = False) -> int:
     """
     下載單一公司在指定年份區間的所有季度財報 PDF。
 
+    回傳:
+      requests_made (int): 實際發送了幾次請求（包含成功與查無資料）。
+      
     延遲策略：
-      - 實際下載 PDF 後：5~12 秒（跨季請求是 MOPS 主要封鎖風險點）
-      - 查無資料（SKIPPED）：0.5~1.5 秒（短暫緩衝即可，不需完整間隔）
+      - 跨季請求：因為 Session 重用，使用 INTRA_COMPANY 較短延遲
+      - 查無資料（SKIPPED）：極短延遲
       - 完全跳過（noop）：不等待
     """
     quarters = build_quarter_list(start_year, end_year)
@@ -141,15 +146,21 @@ def download_company(stock_id: str, start_year: int, end_year: int,
         f"共 {total} 個季度"
     )
 
+    # 建立該公司專用的 Session，讓所有季度共用同一個連線
+    company_session = PdfDownloader.get_initialized_session()
+    requests_made = 0
+
     for i, (ce_year, season) in enumerate(quarters):
-        result = download_quarter(stock_id, ce_year, season, market_type, tracker, retry_failed)
+        result = download_quarter(stock_id, ce_year, season, market_type, tracker, retry_failed, session=company_session)
 
         if result == 'downloaded':
-            # 實際條發請求 → 完整跨季延遲
-            delay = random.uniform(config.MIN_DELAY_SECONDS, config.MAX_DELAY_SECONDS)
-            logger.debug(f"  下載完成，跨季等待 {delay:.1f} 秒...")
+            requests_made += 1
+            # 實際發請求 → 同公司跨季延遲 (較短)
+            delay = random.uniform(config.INTRA_COMPANY_MIN_DELAY, config.INTRA_COMPANY_MAX_DELAY)
+            logger.debug(f"  下載完成，同公司跨季等待 {delay:.1f} 秒...")
             time.sleep(delay)
         elif result == 'skipped':
+            requests_made += 1
             # 發了請求但查無資料 → 短暫緩衝
             delay = random.uniform(config.SKIP_MIN_DELAY, config.SKIP_MAX_DELAY)
             logger.debug(f"  查無資料，短暫等待 {delay:.1f} 秒...")
@@ -157,6 +168,7 @@ def download_company(stock_id: str, start_year: int, end_year: int,
         # 'noop' — 完全跳過，不需延遲
 
     logger.info(f"  [{stock_id}] 完成，共 {total} 季。")
+    return requests_made
 
 
 # ── 批量下載所有公司 ──────────────────────────────────────────────
@@ -192,10 +204,16 @@ def run_all(stock_df: pd.DataFrame, end_year: int,
             f"{'='*60}"
         )
 
-        download_company(
+        requests_made = download_company(
             stock_id, start_year, end_year,
             market_type, tracker, retry_failed
         )
+
+        # 若該公司有實際發送請求，且尚未到達最後一間公司，則進行跨公司長假等待
+        if requests_made > 0 and idx < total:
+            delay = random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY)
+            logger.info(f"  切換公司，長間隔等待 {delay:.1f} 秒...")
+            time.sleep(delay)
 
     tracker.print_summary()
     logger.info("全部公司下載作業完成！")
@@ -223,7 +241,7 @@ def run_retry_failed(tracker: ProgressTracker, stock_df: pd.DataFrame,
 
     for stock_id, year, season, report_type in failed_list:
         market_type = market_map.get(str(stock_id), '上市')
-        time.sleep(random.uniform(config.MIN_DELAY_SECONDS, config.MAX_DELAY_SECONDS))
+        time.sleep(random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY))
         download_quarter(stock_id, year, season, market_type, tracker, retry_failed=True)
 
     tracker.print_summary()

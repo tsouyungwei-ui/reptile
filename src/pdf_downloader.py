@@ -47,17 +47,18 @@ class PdfDownloader:
     # ── 路徑工具 ──────────────────────────────────────────────────
 
     @staticmethod
-    def get_save_path(stock_id: str, ce_year: int, season: int) -> str:
-        """回傳 PDF 的完整儲存路徑，並確保目錄存在"""
+    def get_save_path(stock_id: str, ce_year: int, season: int, ext: str = "pdf") -> str:
+        """回傳檔案的完整儲存路徑，並確保目錄存在"""
         directory = os.path.join(config.PDF_DIR, str(stock_id), str(ce_year))
         os.makedirs(directory, exist_ok=True)
-        return os.path.join(directory, f"Q{season}.pdf")
+        ext = ext.lstrip('.')
+        return os.path.join(directory, f"Q{season}.{ext}")
 
     @staticmethod
-    def is_valid_pdf(path: str, min_size_kb: int = 50) -> bool:
+    def is_valid_file(path: str, min_size_kb: int = 50) -> bool:
         """
-        檢查 PDF 是否存在且大小合理。
-        財報 PDF 通常 > 1 MB，50 KB 以下通常是錯誤頁面。
+        檢查檔案是否存在且大小合理。
+        財報通常 > 1 MB，50 KB 以下通常是錯誤頁面。
         """
         if not os.path.exists(path):
             return False
@@ -185,23 +186,23 @@ class PdfDownloader:
             logger.error(f"  ✗ step=9 請求失敗（{filename}）：{e}")
             return False
 
-        # 解析回傳 HTML（Big5 編碼）中的臨時 PDF 路徑
-        # 格式：<a href='/pdf/202304_2330_AI1_20260304_094212.pdf'>
+        # 解析回傳 HTML（Big5 編碼）中的臨時檔案路徑
+        # 格式可能如：<a href='/pdf/202304_2330_AI1_20260304_094212.pdf'> 或 .doc
         html = r2.content.decode('big5', errors='replace')
-        m = re.search(r"href='(/pdf/[^']+\.pdf)'", html)
+        m = re.search(r"href='(/[^']+\.[a-zA-Z0-9]+)'", html)
         if not m:
-            logger.warning(f"  step=9 回應中找不到 /pdf/... 連結，filename={filename}")
+            logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
             logger.debug(f"  回應內容：{html[:200]}")
             return False
 
-        pdf_path = m.group(1)
-        pdf_url  = f"https://doc.twse.com.tw{pdf_path}"
-        logger.info(f"  → GET {pdf_url}")
+        file_path = m.group(1)
+        file_url  = f"https://doc.twse.com.tw{file_path}"
+        logger.info(f"  → GET {file_url}")
 
-        # ── Step 3：GET 下載實際 PDF 串流 ────────────────────────
+        # ── Step 3：GET 下載實際檔案串流 ────────────────────────
         try:
             with sess.get(
-                pdf_url,
+                file_url,
                 headers=cls._headers(referer=TWSE_DOC_URL),
                 stream=True,
                 timeout=config.PDF_DOWNLOAD_TIMEOUT,
@@ -209,10 +210,10 @@ class PdfDownloader:
             ) as r3:
                 r3.raise_for_status()
 
-                # 確認是 PDF / 二進位內容（非 HTML 錯誤頁）
+                # 確認非 HTML 錯誤頁（正常會是 application/pdf 或 application/msword 等）
                 ctype = r3.headers.get('Content-Type', '')
-                if 'html' in ctype.lower():
-                    logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效：{pdf_url}")
+                if 'text/html' in ctype.lower():
+                    logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效：{file_url}")
                     return False
 
                 with open(save_path, 'wb') as f:
@@ -221,7 +222,7 @@ class PdfDownloader:
 
             size_kb = os.path.getsize(save_path) / 1024
             if size_kb < 50:
-                logger.warning(f"  檔案過小（{size_kb:.0f} KB），可能不是有效 PDF")
+                logger.warning(f"  檔案過小（{size_kb:.0f} KB），可能不是有效檔案")
                 os.remove(save_path)
                 return False
 
@@ -229,18 +230,32 @@ class PdfDownloader:
             return True
 
         except Exception as e:
-            logger.error(f"  ✗ PDF GET 失敗（{pdf_url}）：{e}")
+            logger.error(f"  ✗ 檔案 GET 失敗（{file_url}）：{e}")
             if os.path.exists(save_path):
                 os.remove(save_path)
             return False
+
+    # ── Session 初始化 ────────────────────────────────────────────
+
+    @classmethod
+    def get_initialized_session(cls) -> requests.Session | None:
+        """建立並初始化一個 Session（取得合法的初始 Cookie）"""
+        sess = requests.Session()
+        try:
+            sess.get(TWSE_DOC_URL, headers=cls._headers(), timeout=10, verify=False)
+            return sess
+        except Exception as e:
+            logger.error(f"  初始化 Session 失敗：{e}")
+            return None
 
     # ── 公開主介面 ────────────────────────────────────────────────
 
     @classmethod
     def download(cls, stock_id: str, ce_year: int, season: int,
-                 market_type: str = '上市') -> str | None:
+                 market_type: str = '上市',
+                 session: requests.Session = None) -> str | None:
         """
-        下載指定公司、年份、季度的完整財務報告 PDF。
+        下載指定公司、年份、季度的完整財務報告檔案（不限於 PDF）。
 
         優先下載中文合併財報（AI1），其次個體財報（AI3），
         最後接受任何其他財報格式。
@@ -252,27 +267,30 @@ class PdfDownloader:
             market_type: 目前未使用（TWSE 不分市場類型），保留供擴充
 
         Returns:
-            成功時回傳 PDF 儲存路徑（str）；失敗 / 查無資料時回傳 None。
+            成功時回傳檔案儲存路徑（str）；失敗 / 查無資料時回傳 None。
         """
         roc_year  = ce_to_roc(ce_year)
-        save_path = cls.get_save_path(stock_id, ce_year, season)
 
-        # ── 快取檢查：有效 PDF 直接跳過 ──────────────────────────
-        if cls.is_valid_pdf(save_path):
-            logger.debug(f"  已存在（跳過）：{save_path}")
-            return save_path
+        # ── 快取檢查：有效檔案直接跳過 ──────────────────────────
+        directory = os.path.join(config.PDF_DIR, str(stock_id), str(ce_year))
+        if os.path.exists(directory):
+            for f in os.listdir(directory):
+                if f.startswith(f"Q{season}.") and cls.is_valid_file(os.path.join(directory, f)):
+                    save_path = os.path.join(directory, f)
+                    logger.debug(f"  已存在（跳過）：{save_path}")
+                    return save_path
 
         logger.info(
             f"  [{stock_id}] {ce_year}年Q{season}（民國{roc_year}年第{season}季）"
         )
 
-        # 建立獨立 Session，先訪問首頁取得合法 Cookie
-        sess = requests.Session()
-        try:
-            sess.get(TWSE_DOC_URL, headers=cls._headers(), timeout=10, verify=False)
-        except Exception as e:
-            logger.error(f"  初始化 Session 失敗：{e}")
-            return None
+        # 使用傳入的 Session，或建立獨立 Session（先訪問首頁取得合法 Cookie）
+        if session is not None:
+            sess = session
+        else:
+            sess = cls.get_initialized_session()
+            if sess is None:
+                return None
 
         # ── 查詢可下載的 PDF 清單 ─────────────────────────────────
         files = cls._query_file_list(sess, stock_id, roc_year, season)
@@ -297,6 +315,11 @@ class PdfDownloader:
         for file_info in files_sorted:
             fn = file_info['filename']
             desc = file_info.get('desc', '')
+            
+            # 從檔名決定副檔名 (若無則預設 pdf)
+            ext = fn.split('.')[-1].lower() if '.' in fn else 'pdf'
+            save_path = cls.get_save_path(stock_id, ce_year, season, ext)
+            
             logger.info(f"  → 下載：{fn}（{desc}）")
 
             if cls._download_file(

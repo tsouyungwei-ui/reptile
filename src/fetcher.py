@@ -39,7 +39,7 @@ class fetcher:
     @staticmethod
     def sleep_randomly():
         """隨機睡眠 3~7 秒以避免存取過快"""
-        delay = random.uniform(config.MIN_DELAY_SECONDS, config.MAX_DELAY_SECONDS)
+        delay = random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY)
         time.sleep(delay)
 
     @classmethod

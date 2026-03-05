@@ -28,13 +28,13 @@ IFRS_START_YEAR = 2013
 # ── 抓取設定 ──────────────────────────────────────────────
 RETRY_COUNT = 5
 
-# 同一季的查詢與下載步驟之間（低風險）
-INTRA_QUARTER_MIN_DELAY = 1
-INTRA_QUARTER_MAX_DELAY = 3
+# 同一公司的跨季度之間（因為重用 Session，風險較低）
+INTRA_COMPANY_MIN_DELAY = 1.0
+INTRA_COMPANY_MAX_DELAY = 2.5
 
-# 跨季度 / 跨公司之間（主要封鎖風險點，有實際下載時使用）
-MIN_DELAY_SECONDS = 5
-MAX_DELAY_SECONDS = 12
+# 跨公司之間（需要重置連線，主要封鎖風險點）
+INTER_COMPANY_MIN_DELAY = 5.0
+INTER_COMPANY_MAX_DELAY = 10.0
 
 # 查無資料（SKIPPED）時的短暫緩衝延遲（避免過快請求，但不需要完整間隔）
 SKIP_MIN_DELAY = 0.5
