@@ -14,6 +14,8 @@ logs/
 # Data (PDFs & raw data are too large for git)
 data/pdfs/
 data/raw/
+# Progress DB: tracked manually (commit when crawling is done)
+data/processed/download_progress.sqlite
 台灣上市櫃公司財報/
 
 # PDF files
