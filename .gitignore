@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# OS generated files
+.DS_Store
+
+# Logs and Data
+logs/
+data/
+台灣上市櫃公司財報/
+
+# PDF files as requested
+*.pdf
+pdfs/
