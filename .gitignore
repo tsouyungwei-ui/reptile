@@ -7,11 +7,14 @@ venv/
 # OS generated files
 .DS_Store
 
-# Logs and Data
+# Logs
 logs/
-data/
+*.log
+
+# Data (PDFs & raw data are too large for git)
+data/pdfs/
+data/raw/
 台灣上市櫃公司財報/
 
-# PDF files as requested
+# PDF files
 *.pdf
-pdfs/
