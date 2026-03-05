@@ -175,8 +175,22 @@ def download_company(stock_id: str, start_year: int, end_year: int,
 
 def run_all(stock_df: pd.DataFrame, end_year: int,
             tracker: ProgressTracker, retry_failed: bool,
-            limit: int = None):
+            limit: int = None, node_file: str = None):
     """批量下載股票清單中所有公司的財報 PDF"""
+
+    # ── Node 篩選：只執行此台電腦負責的公司 ─────────────────────
+    if node_file:
+        if not os.path.exists(node_file):
+            logger.error(
+                f"找不到 Node 分配檔：{node_file}\n"
+                "請先在主電腦執行：python split_workload.py"
+            )
+            return
+        with open(node_file, "r", encoding="utf-8") as f:
+            assigned_ids = {line.strip() for line in f if line.strip()}
+        stock_df = stock_df[stock_df["stock_id"].isin(assigned_ids)].reset_index(drop=True)
+        logger.info(f"[Node 模式] 本機負責 {len(stock_df)} 間公司（來源：{node_file}）")
+
     if limit:
         stock_df = stock_df.head(limit)
         logger.info(f"測試模式：只下載前 {limit} 間公司")
@@ -282,6 +296,14 @@ def main():
         '--retry-failed', action='store_true',
         help='重試所有先前標記為 FAILED 的項目'
     )
+    parser.add_argument(
+        '--node', type=int, default=None,
+        help=(
+            '指定本機為第幾號（1-indexed）。\n'
+            '需先執行 split_workload.py 產生 node_N.txt 分配檔。\n'
+            '例如：--node 1（代表此電腦執行第 1 份工作）'
+        )
+    )
 
     args = parser.parse_args()
 
@@ -340,12 +362,19 @@ def main():
             logger.error("無法載入股票清單，請先執行 --fetch-list。")
             return
 
+        # 解析 node 分配檔路徑
+        node_file = None
+        if args.node is not None:
+            node_file = os.path.join(config.PROCESSED_DIR, f"node_{args.node}.txt")
+            logger.info(f"Node 模式啟動：node={args.node}，分配檔={node_file}")
+
         run_all(
-            stock_df  = stock_df,
-            end_year  = args.end_year,
-            tracker   = tracker,
+            stock_df     = stock_df,
+            end_year     = args.end_year,
+            tracker      = tracker,
             retry_failed = args.retry_failed,
-            limit     = args.limit,
+            limit        = args.limit,
+            node_file    = node_file,
         )
         return
 
