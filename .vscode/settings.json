@@ -1,0 +1,25 @@
+{
+  // ── 檔案排除設定（VS Code 不顯示、不索引這些路徑）──────────────
+  // 目的：避免 AI 助理工具讀取 data/ 目錄（數 GB PDF）和 log 檔造成 token 暴增
+  "files.exclude": {
+    "data/": true,
+    "**/*.pdf": true,
+    "**/__pycache__/": true,
+    "**/venv/": true,
+    "台灣上市櫃公司財報/": true
+  },
+  // ── 搜尋排除（Ctrl+Shift+F 不搜尋這些路徑）──────────────────────
+  "search.exclude": {
+    "data/": true,
+    "**/*.pdf": true,
+    "**/venv/": true,
+    "台灣上市櫃公司財報/": true
+  },
+  // ── File Watcher 排除（不監聽這些目錄的變動，減少 CPU/IO 消耗）──
+  "files.watcherExclude": {
+    "**/data/**": true,
+    "**/*.log": true,
+    "**/venv/**": true,
+    "台灣上市櫃公司財報/**": true
+  }
+}

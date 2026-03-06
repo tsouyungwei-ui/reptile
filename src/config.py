@@ -3,7 +3,15 @@ import datetime
 
 # ── 目錄設定 ──────────────────────────────────────────────
 BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR      = os.path.join(BASE_DIR, "data")
+
+# ⚠️  資料目錄刻意放在專案資料夾「外部」，
+#     避免 VS Code / AI 助理索引數 GB 的 PDF 而大量消耗 token。
+#     若需要改路徑，設定環境變數 TAIWAN_REPORT_DATA_DIR 即可覆蓋，
+#     例如：export TAIWAN_REPORT_DATA_DIR=/Volumes/ExternalDisk/台灣財報資料
+DATA_DIR      = os.environ.get(
+    "TAIWAN_REPORT_DATA_DIR",
+    os.path.join(os.path.expanduser("~"), "Documents", "台灣財報資料")
+)
 PDF_DIR       = os.path.join(DATA_DIR, "pdfs")       # 財報 PDF 存放根目錄
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")  # CSV / SQLite
 
