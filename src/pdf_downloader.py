@@ -157,83 +157,122 @@ class PdfDownloader:
     @classmethod
     def _download_file(cls, sess: requests.Session,
                        kind: str, co_id: str, filename: str,
-                       save_path: str) -> bool:
+                       save_path: str, max_retries: int = 3) -> bool:
         """
         TWSE 三步下載流程：
           Step 2: POST step=9  → 回傳 HTML（非 PDF），內含時間戳記 /pdf/... 連結
           Step 3: GET  /pdf/.. → 實際的 PDF 串流
 
-        若任一步驟失敗，自動清除不完整檔案。
+        若任一步驟失敗，加入自動重試與強制重新建立 Session，避免因 WAF 阻擋（BadStatusLine）而立即失敗。
         """
-        # ── Step 2：觸發下載，取得臨時 PDF 連結 ─────────────────
-        data = {
-            'step':     '9',
-            'colorchg': '1',
-            'kind':     kind,
-            'co_id':    co_id,
-            'filename': filename,
-        }
-        try:
-            r2 = sess.post(
-                TWSE_DOC_URL,
-                data=data,
-                headers=cls._headers(),
-                timeout=30,
-                verify=False,
-            )
-            r2.raise_for_status()
-        except Exception as e:
-            logger.error(f"  ✗ step=9 請求失敗（{filename}）：{e}")
-            return False
+        current_sess = sess
+        
+        for attempt in range(max_retries):
+            # ── Step 2：觸發下載，取得臨時 PDF 連結 ─────────────────
+            data = {
+                'step':     '9',
+                'colorchg': '1',
+                'kind':     kind,
+                'co_id':    co_id,
+                'filename': filename,
+            }
+            try:
+                r2 = current_sess.post(
+                    TWSE_DOC_URL,
+                    data=data,
+                    headers=cls._headers(),
+                    timeout=30,
+                    verify=False,
+                )
+                r2.raise_for_status()
+            except Exception as e:
+                logger.error(f"  ✗ step=9 請求失敗（{filename}）嘗試 {attempt+1}/{max_retries}：{e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(10)
+                    new_sess = cls.get_initialized_session()
+                    if new_sess:
+                        current_sess = new_sess
+                continue
 
-        # 解析回傳 HTML（Big5 編碼）中的臨時檔案路徑
-        # 格式可能如：<a href='/pdf/202304_2330_AI1_20260304_094212.pdf'> 或 .doc
-        html = r2.content.decode('big5', errors='replace')
-        m = re.search(r"href='(/[^']+\.[a-zA-Z0-9]+)'", html)
-        if not m:
-            logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
-            logger.debug(f"  回應內容：{html[:200]}")
-            return False
+            # 解析回傳 HTML（Big5 編碼）中的臨時檔案路徑
+            # 強制要求路徑包含 /pdf/ ，避免抓到 <link href='/ppp.css'>
+            html = r2.content.decode('big5', errors='replace')
+            m = re.search(r"href='(/pdf/[^']+\.[a-zA-Z0-9]+)'", html)
+            if not m:
+                logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
+                logger.debug(f"  回應內容：{html[:200]}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(10)
+                    new_sess = cls.get_initialized_session()
+                    if new_sess:
+                        current_sess = new_sess
+                continue
 
-        file_path = m.group(1)
-        file_url  = f"https://doc.twse.com.tw{file_path}"
-        logger.info(f"  → GET {file_url}")
+            file_path = m.group(1)
+            file_url  = f"https://doc.twse.com.tw{file_path}"
+            logger.info(f"  → GET {file_url}")
 
-        # ── Step 3：GET 下載實際檔案串流 ────────────────────────
-        try:
-            with sess.get(
-                file_url,
-                headers=cls._headers(referer=TWSE_DOC_URL),
-                stream=True,
-                timeout=config.PDF_DOWNLOAD_TIMEOUT,
-                verify=False,
-            ) as r3:
-                r3.raise_for_status()
+            # ── Step 3：GET 下載實際檔案串流 ────────────────────────
+            try:
+                with current_sess.get(
+                    file_url,
+                    headers=cls._headers(referer=TWSE_DOC_URL),
+                    stream=True,
+                    timeout=config.PDF_DOWNLOAD_TIMEOUT,
+                    verify=False,
+                ) as r3:
+                    r3.raise_for_status()
 
-                # 確認非 HTML 錯誤頁（正常會是 application/pdf 或 application/msword 等）
-                ctype = r3.headers.get('Content-Type', '')
-                if 'text/html' in ctype.lower():
-                    logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效：{file_url}")
-                    return False
+                    # 確認非 HTML 錯誤頁（正常會是 application/pdf 或 application/msword 等）
+                    ctype = r3.headers.get('Content-Type', '')
+                    if 'text/html' in ctype.lower():
+                        logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效：{file_url}")
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(10)
+                            new_sess = cls.get_initialized_session()
+                            if new_sess:
+                                current_sess = new_sess
+                        continue
 
-                with open(save_path, 'wb') as f:
-                    for chunk in r3.iter_content(chunk_size=65536):
-                        f.write(chunk)
+                    with open(save_path, 'wb') as f:
+                        for chunk in r3.iter_content(chunk_size=65536):
+                            f.write(chunk)
 
-            size_kb = os.path.getsize(save_path) / 1024
-            if size_kb < 50:
-                logger.warning(f"  檔案過小（{size_kb:.0f} KB），可能不是有效檔案")
-                os.remove(save_path)
-                return False
+                size_kb = os.path.getsize(save_path) / 1024
+                if size_kb < 50:
+                    logger.warning(f"  檔案過小（{size_kb:.0f} KB），可能不是有效檔案")
+                    os.remove(save_path)
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(10)
+                        new_sess = cls.get_initialized_session()
+                        if new_sess:
+                            current_sess = new_sess
+                    continue
 
-            logger.info(f"  ✓ 下載完成（{size_kb:.0f} KB）：{save_path}")
-            return True
+                logger.info(f"  ✓ 下載完成（{size_kb:.0f} KB）：{save_path}")
+                
+                # 如果在這個過程中成功更換了 session，我們需要把修改過的 session 寫回去 (如果外層有關心)
+                # 這裡不特別依賴外部存取，因為通常下一季會重新呼叫 download() 但共用 session
+                # 為了更好的封裝性，我們其實只在此 function 內用 current_sess
+                return True
 
-        except Exception as e:
-            logger.error(f"  ✗ 檔案 GET 失敗（{file_url}）：{e}")
-            if os.path.exists(save_path):
-                os.remove(save_path)
-            return False
+            except Exception as e:
+                logger.error(f"  ✗ 檔案 GET 失敗（{file_url}）嘗試 {attempt+1}/{max_retries}：{e}")
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(10)
+                    new_sess = cls.get_initialized_session()
+                    if new_sess:
+                        current_sess = new_sess
+                continue
+            
+        return False
 
     # ── Session 初始化 ────────────────────────────────────────────
 
