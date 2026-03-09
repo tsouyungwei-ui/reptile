@@ -83,19 +83,27 @@ def load_remaining_stocks(stock_csv: str, done_ids: set[str]) -> pd.DataFrame:
     return remaining
 
 
-def split_round_robin(df: pd.DataFrame, n_parts: int) -> list[pd.DataFrame]:
+def split_continuous(df: pd.DataFrame, n_parts: int) -> list[pd.DataFrame]:
     """
-    以 round-robin 方式將 DataFrame 分成 n_parts 份，
-    確保每份數量差距最多 1 間。
+    以連續區塊的方式將 DataFrame 分成 n_parts 份，
+    前面的份數可能會多拿 1 間公司。
     """
-    parts = [[] for _ in range(n_parts)]
-    for i, row in enumerate(df.itertuples(index=False)):
-        parts[i % n_parts].append(row)
-
-    return [
-        pd.DataFrame(p, columns=df.columns) if p else pd.DataFrame(columns=df.columns)
-        for p in parts
-    ]
+    total = len(df)
+    base_size = total // n_parts
+    remainder = total % n_parts
+    
+    parts = []
+    start_idx = 0
+    for i in range(n_parts):
+        size = base_size + (1 if i < remainder else 0)
+        end_idx = start_idx + size
+        
+        part_df = df.iloc[start_idx:end_idx].copy()
+        parts.append(part_df)
+        
+        start_idx = end_idx
+        
+    return parts
 
 
 def write_node_files(parts: list[pd.DataFrame], output_dir: str):
@@ -158,8 +166,8 @@ def main():
         return
 
     # Step 3：分割並輸出
-    print(f"\n[3/3] 以 round-robin 分成 {args.parts} 份...")
-    parts = split_round_robin(remaining_df, args.parts)
+    print(f"\n[3/3] 以連續區塊分成 {args.parts} 份...")
+    parts = split_continuous(remaining_df, args.parts)
 
     print()
     print("─" * 60)
