@@ -175,6 +175,9 @@ def download_company(stock_id: str, start_year: int, end_year: int,
             time.sleep(delay)
         # 'noop' — 完全跳過，不需延遲
 
+    # 清空這間公司的快取，避免佔用過多記憶體
+    PdfDownloader.clear_cache()
+
     logger.info(f"  [{stock_id}] 完成，共 {total} 季。")
     return requests_made
 
