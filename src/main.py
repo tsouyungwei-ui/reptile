@@ -103,12 +103,14 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
     """
     # ── 斷點續爬判斷 ──────────────────────────────────────────
     if tracker.is_done(stock_id, ce_year, season, REPORT_TYPE):
-        logger.debug(f"  SKIP(DONE): {stock_id} {ce_year}Q{season}")
-        return 'noop'
-
-    if not retry_failed and tracker.is_recorded(stock_id, ce_year, season, REPORT_TYPE):
-        logger.debug(f"  SKIP(recorded): {stock_id} {ce_year}Q{season}")
-        return 'noop'
+        # 即使標記為 DONE，仍需檢查實體檔案是否存在且有效
+        # 假設 PDF 檔案名稱結尾為 .pdf (PdfDownloader.download 會檢查更精確的路徑，此處我們做基本防呆)
+        save_path = PdfDownloader.get_save_path(stock_id, ce_year, season)
+        if PdfDownloader.is_valid_file(save_path):
+            logger.debug(f"  SKIP(DONE): {stock_id} {ce_year}Q{season}")
+            return 'noop'
+        else:
+            logger.info(f"  RETRY(MISSING): {stock_id} {ce_year}Q{season} 標記為 DONE 但檔案不存在或過小")
 
     # ── 實際下載 ──────────────────────────────────────────────
     result = PdfDownloader.download(stock_id, ce_year, season, market_type, session=session)
