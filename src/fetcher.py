@@ -87,7 +87,8 @@ class fetcher:
     def robust_get(cls, url, params=None, max_retries=config.RETRY_COUNT):
         """強化版 GET 請求，遭遇失敗會自動等待與重試"""
         for count in range(max_retries):
-            cls.sleep_randomly()
+            if count > 0:
+                cls.sleep_randomly()
             headers = cls.get_headers()
             try:
                 response = cls._session.get(url, headers=headers, params=params, timeout=15, verify=False)

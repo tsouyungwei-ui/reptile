@@ -113,13 +113,19 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
     # ── 實際下載 ──────────────────────────────────────────────
     result = PdfDownloader.download(stock_id, ce_year, season, market_type, session=session)
 
-    if result:
+    if result:            # str 路徑 → 成功下載
         tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'DONE')
         return 'downloaded'
-    else:
-        # 查無資料（公司尚未上市、或該季度 MOPS 無存檔）→ SKIPPED
+    elif result is None:  # None → TWSE 查無資料（公司尚未上市或無存檔）
         tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'SKIPPED')
         return 'skipped'
+    else:                 # False → 下載失敗（網路錯誤、所有 retry 用盡）
+        tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'FAILED')
+        logger.warning(
+            f"  FAILED: {stock_id} {ce_year}Q{season} 下載失敗，"
+            "已標記為 FAILED，可用 --retry-failed 重試"
+        )
+        return 'downloaded'  # 發了請求，計入 requests_made（以觸發正常延遲）
 
 
 # ── 下載整間公司的所有季度 ────────────────────────────────────────

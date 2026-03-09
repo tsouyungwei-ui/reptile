@@ -39,38 +39,37 @@ python -m src.main --all
 
 ## 多台電腦分散執行
 
-將未完成的公司清單平均分配給多台電腦，各自獨立爬取，互不干擾。
+為了加速下載，目前專案已經預先將 2000 多家上市櫃公司，均分為 5 等份（存放在 `data/processed/node_1.txt` ~ `node_5.txt`）。
 
-### 步驟一：在主電腦產生分配檔（只需做一次）
+你只需要將這個已經分配好資料夾的專案（含 `data/processed/`），整包複製到其他不同的電腦上，並指定每一台跑不同的 Node 編號即可。
 
+### 步驟說明
+
+1. 將整個專案（包含 `data/processed/node_*.txt` 等資料）複製到 5 台不同的電腦。
+2. 在各自的電腦上安裝環境：
+   ```bash
+   python -m venv venv
+   source venv/bin/activate      # Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+3. 在各台電腦的終端機執行對應的腳本，請依序將 `[你的編號]` 換成 1~5：
+
+#### 方式 A：背景執行（推薦，關閉終端機也會繼續跑）
 ```bash
-python split_workload.py          # 預設分成 5 份
-python split_workload.py --parts 3  # 分成 3 份
-python split_workload.py --dry-run  # 只預覽，不寫入
+bash run_node.sh [你的編號]
+# 範例：第一台電腦執行 bash run_node.sh 1
+# 範例：第二台電腦執行 bash run_node.sh 2
 ```
 
-執行後會自動在 `data/processed/` 產生 `node_1.txt` ～ `node_N.txt`，
-每個檔案記錄該台電腦負責爬取的股票代號。
+**管理背景爬蟲**
+- 查看狀態：`bash run_node.sh 1 status`
+- 查看即時日誌：`tail -f logs/node_1.log`
+- 停止程式：`bash run_node.sh 1 stop`
 
-### 步驟二：複製整個資料夾給各台電腦
-
-> 確保 `data/processed/node_*.txt` 和 `data/processed/taiwan_stock_list.csv` 都一起複製過去。
-
-### 步驟三：各台電腦在背景啟動爬蟲
-
+#### 方式 B：前景執行（方便直接看畫面）
 ```bash
-bash run_node.sh 1    # 電腦 1
-bash run_node.sh 2    # 電腦 2
-bash run_node.sh 3    # 電腦 3
-bash run_node.sh 4    # 電腦 4
-bash run_node.sh 5    # 電腦 5
-```
-
-### 管理背景爬蟲
-
-```bash
-bash run_node.sh 1 status   # 查看執行狀態與最新 log
-bash run_node.sh 1 stop     # 停止爬蟲
+python -m src.main --all --node [你的編號]
+# 範例：第一台電腦執行 python -m src.main --all --node 1
 ```
 
 Log 存放於 `logs/node_1.log`、`logs/node_2.log` ...
