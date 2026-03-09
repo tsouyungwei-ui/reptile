@@ -20,3 +20,7 @@ data/processed/download_progress.sqlite
 
 # PDF files
 *.pdf
+Debug分析用/
+
+# Experiments & Playground
+experiments/

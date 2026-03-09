@@ -78,7 +78,7 @@ class PdfDownloader:
 
     @classmethod
     def _query_file_list(cls, sess: requests.Session,
-                         stock_id: str, roc_year: int, season: int) -> list[dict]:
+                         stock_id: str, roc_year: int, season: int, max_retries: int = 3) -> list[dict] | None:
         """
         POST step=1 到 TWSE 文件中心，解析可下載的 PDF 清單。
 
@@ -87,8 +87,9 @@ class PdfDownloader:
         必須用 regex 解析，不能用 BeautifulSoup 的 find_all('a', href=...)。
 
         回傳:
-          [{'kind': 'A', 'co_id': '2330', 'filename': '202304_2330_AI1.pdf',
-            'description': 'IFRSs合併財報'}, ...]
+          - [] 如果確實查無資料
+          - None 如果發生錯誤或被 WAF 阻擋
+          - [{...}, ...] 正常結果
         """
         data = {
             'step':     '1',
@@ -96,61 +97,77 @@ class PdfDownloader:
             'co_id':    str(stock_id),
             'year':     str(roc_year),
             'seamon':   str(season),
-            'mtype':    'A',   # 財務報告（mtype=A 即可，無須指定dtype）
+            'mtype':    'A',   # 財務報告
         }
-        try:
-            resp = sess.post(
-                TWSE_DOC_URL,
-                data=data,
-                headers=cls._headers(),
-                timeout=20,
-                verify=False,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"  查詢失敗（{stock_id} {roc_year}年Q{season}）：{e}")
-            return []
-
-        # 解析 HTML（Big5 編碼）
-        html = resp.content.decode('big5', errors='replace')
-
-        # 找「查無資料」
-        if '查無所需資料' in html:
-            logger.debug(f"  {stock_id} 民國{roc_year}年Q{season}：TWSE 查無資料")
-            return []
-
-        # 以 regex 解析所有 readfile2("kind","coid","filename") 呼叫
-        # 同時用 BeautifulSoup 抓每個連結的描述文字
-        soup = BeautifulSoup(html, 'lxml')
-        rows = soup.find_all('tr')
-
-        results = []
-        # readfile2 regex：匹配三個雙引號引數
-        pattern = re.compile(r'readfile2?\("([^"]+)","([^"]+)","([^"]+)"\)')
-
-        for a_tag in soup.find_all('a', href=True):
-            href = a_tag.get('href', '')
-            m = pattern.search(href)
-            if not m:
+        
+        current_sess = sess
+        for attempt in range(max_retries):
+            try:
+                resp = current_sess.post(
+                    TWSE_DOC_URL,
+                    data=data,
+                    headers=cls._headers(),
+                    timeout=20,
+                    verify=False,
+                )
+                resp.raise_for_status()
+            except Exception as e:
+                logger.error(f"  ✗ 查詢失敗（{stock_id} {roc_year}年Q{season}）嘗試 {attempt+1}/{max_retries}：{e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(10)
+                    new_sess = cls.get_initialized_session()
+                    if new_sess:
+                        current_sess = new_sess
                 continue
-            kind, co_id, filename = m.group(1), m.group(2), m.group(3)
 
-            # 取同一行的「資料細節說明」欄位文字（如 IFRSs合併財報）
-            desc = ''
-            tr = a_tag.find_parent('tr')
-            if tr:
-                tds = tr.find_all('td')
-                if len(tds) >= 6:
-                    desc = tds[5].get_text(strip=True)
+            # 解析 HTML（Big5 編碼）
+            html = resp.content.decode('big5', errors='replace')
 
-            results.append({
-                'kind':     kind,
-                'co_id':    co_id,
-                'filename': filename,
-                'desc':     desc,
-            })
+            # 找「查無資料」
+            if '查無所需資料' in html:
+                logger.debug(f"  {stock_id} 民國{roc_year}年Q{season}：TWSE 查無資料")
+                return []
 
-        return results
+            soup = BeautifulSoup(html, 'lxml')
+            results = []
+            pattern = re.compile(r'readfile2?\("([^"]+)","([^"]+)","([^"]+)"\)')
+
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag.get('href', '')
+                m = pattern.search(href)
+                if not m:
+                    continue
+                kind, co_id, filename = m.group(1), m.group(2), m.group(3)
+
+                desc = ''
+                tr = a_tag.find_parent('tr')
+                if tr:
+                    tds = tr.find_all('td')
+                    if len(tds) >= 6:
+                        desc = tds[5].get_text(strip=True)
+
+                results.append({
+                    'kind':     kind,
+                    'co_id':    co_id,
+                    'filename': filename,
+                    'desc':     desc,
+                })
+
+            if results:
+                return results
+                
+            # If no results and no '查無所需資料' found: WAF blocked
+            logger.warning(f"  ✗ step=1 收到非預期回應（可能遭阻擋），嘗試 {attempt+1}/{max_retries}")
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(10)
+                new_sess = cls.get_initialized_session()
+                if new_sess:
+                    current_sess = new_sess
+        
+        # Exceeded retries
+        return None
 
     # ── Step 2：串流下載 PDF ──────────────────────────────────────
 
@@ -337,7 +354,13 @@ class PdfDownloader:
         # ── 查詢可下載的 PDF 清單 ─────────────────────────────────
         files = cls._query_file_list(sess, stock_id, roc_year, season)
 
+        if files is None:
+            # 查詢過程失敗 (例如被 WAF 阻擋或發生 Exception)，回傳 False 讓上層標記為 FAILED
+            logger.error(f"  [{stock_id}] {ce_year}Q{season} 查詢檔案清單失敗")
+            return False
+
         if not files:
+            # 正常查詢但確實無資料 (回傳 [])
             return None
 
         logger.debug(f"  找到 {len(files)} 個檔案：{[f['filename'] for f in files]}")
