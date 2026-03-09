@@ -60,6 +60,11 @@ TWSE_DOC_BASE_URL  = "https://doc.twse.com.tw"
 MOPS_DOC_QUERY_URL = "https://mops.twse.com.tw/mops/web/ajax_t164sb03"
 MOPS_BASE_URL      = "https://mops.twse.com.tw"
 
+# MOPS 三大財報查詢端點（供 parser.py 使用）
+MOPS_INCOME_STATEMENT_URL = "https://mops.twse.com.tw/mops/web/ajax_t163sb04"  # 綜合損益表
+MOPS_BALANCE_SHEET_URL    = "https://mops.twse.com.tw/mops/web/ajax_t163sb05"  # 資產負債表
+MOPS_CASH_FLOW_URL        = "https://mops.twse.com.tw/mops/web/ajax_t163sb20"  # 現金流量表
+
 # ISIN 頁面（抓股票清單用）
 ISIN_BASE_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode={}"
 

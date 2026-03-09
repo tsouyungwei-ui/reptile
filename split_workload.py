@@ -22,12 +22,13 @@ import os
 import sqlite3
 import argparse
 import pandas as pd
+from src import config
 
 # ── 路徑設定 ──────────────────────────────────────────────────────
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-PROCESSED_DIR  = os.path.join(BASE_DIR, "data", "processed")
-DB_PATH        = os.path.join(PROCESSED_DIR, "download_progress.sqlite")
-STOCK_LIST_CSV = os.path.join(PROCESSED_DIR, "taiwan_stock_list.csv")
+PROCESSED_DIR  = config.PROCESSED_DIR
+DB_PATH        = config.DB_PATH
+STOCK_LIST_CSV = config.STOCK_LIST_CSV
 REPORT_TYPE    = "full_pdf"
 
 

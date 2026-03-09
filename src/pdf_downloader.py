@@ -71,7 +71,7 @@ class PdfDownloader:
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.5",
             "Referer": referer,
-            "Connection": "keep-alive",
+            "Connection": "close",  # 避免 TWSE 伺服器主動中斷 keep-alive 導致 BadStatusLine 錯誤
         }
 
     # ── Step 1：查詢可下載的 PDF 清單 ────────────────────────────
@@ -292,7 +292,7 @@ class PdfDownloader:
     @classmethod
     def download(cls, stock_id: str, ce_year: int, season: int,
                  market_type: str = '上市',
-                 session: requests.Session = None) -> str | None:
+                 session: requests.Session = None) -> str | None | bool:
         """
         下載指定公司、年份、季度的完整財務報告檔案（不限於 PDF）。
 
@@ -306,7 +306,9 @@ class PdfDownloader:
             market_type: 目前未使用（TWSE 不分市場類型），保留供擴充
 
         Returns:
-            成功時回傳檔案儲存路徑（str）；失敗 / 查無資料時回傳 None。
+            - str  : 成功，回傳檔案儲存路徑
+            - None : TWSE 查無此季度資料（公司尚未上市或無存檔）
+            - False: 下載過程失敗（網路錯誤、Session 初始化失敗、所有 retry 用盡）
         """
         roc_year  = ce_to_roc(ce_year)
 
@@ -329,7 +331,8 @@ class PdfDownloader:
         else:
             sess = cls.get_initialized_session()
             if sess is None:
-                return None
+                # Session 初始化失敗屬於「下載失敗」，非「查無資料」
+                return False
 
         # ── 查詢可下載的 PDF 清單 ─────────────────────────────────
         files = cls._query_file_list(sess, stock_id, roc_year, season)
@@ -370,5 +373,6 @@ class PdfDownloader:
             ):
                 return save_path
 
+        # 有找到檔案清單，但所有連結都下載失敗 → 屬於「下載失敗」
         logger.error(f"  [{stock_id}] {ce_year}Q{season} 全部下載連結失敗")
-        return None
+        return False
