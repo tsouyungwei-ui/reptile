@@ -40,7 +40,11 @@ TWSE_DOC_URL = "https://doc.twse.com.tw/server-java/t57sb01"
 # 全域連鎖失敗計數器，用於觸發長期休眠
 _consecutive_failures = 0
 _MAX_CONSECUTIVE_FAILURES = 15
-_LONG_COOLDOWN_SECONDS = 600  # 10 分鐘
+
+# 遞增休眠（指數退避）設定
+_BASE_COOLDOWN_SECONDS = 900  # 基礎休眠：15 分鐘
+_MAX_COOLDOWN_SECONDS = 7200  # 最大休眠：2 小時
+_current_cooldown = _BASE_COOLDOWN_SECONDS
 
 
 def ce_to_roc(ce_year: int) -> int:
@@ -152,12 +156,18 @@ class PdfDownloader:
 
     @classmethod
     def _check_cooldown(cls):
-        """檢查是否達到連續失敗次數，觸發長時冷卻"""
-        global _consecutive_failures
+        """檢查是否達到連續失敗次數，觸發長時冷卻（具備遞增懲罰機制）"""
+        global _consecutive_failures, _current_cooldown
         if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
             logger.critical(f"偵測到連續 {_consecutive_failures} 次嚴重失敗，可能已遭 WAF 封鎖 IP！")
-            logger.critical(f"強制進入 {_LONG_COOLDOWN_SECONDS} 秒的深層休眠冷卻...")
-            time.sleep(_LONG_COOLDOWN_SECONDS)
+            
+            minutes = _current_cooldown // 60
+            logger.critical(f"強制進入 {minutes} 分鐘 ({_current_cooldown} 秒) 的深層休眠冷卻...")
+            time.sleep(_current_cooldown)
+            
+            # 醒來後，將下次的冷卻時間翻倍（上限為 _MAX_COOLDOWN_SECONDS）
+            _current_cooldown = min(_current_cooldown * 2, _MAX_COOLDOWN_SECONDS)
+            
             _consecutive_failures = 0  # 醒來後歸零重試
             logger.info("深層休眠結束，恢復爬蟲作業。")
 
@@ -169,7 +179,7 @@ class PdfDownloader:
         """
         從 TWSE 取得指定股票、年份、季度的 PDF 清單。
         """
-        global _consecutive_failures
+        global _consecutive_failures, _current_cooldown
         stock_id_str = str(stock_id)
 
         # 1) 如果快取已經是這間公司且已查詢過，直接從快取過濾
@@ -215,6 +225,7 @@ class PdfDownloader:
                 )
                 resp.raise_for_status()
                 _consecutive_failures = 0 # 成功則歸零
+                _current_cooldown = _BASE_COOLDOWN_SECONDS # 成功連線，重置冷卻時間
                 
             except Exception as e:
                 logger.error(f"  ✗ 查詢失敗（{stock_id_str} 歷年資料）嘗試 {attempt+1}/{max_retries}：{e}")
@@ -294,7 +305,7 @@ class PdfDownloader:
           Step 3: GET  /pdf/.. → PDF 串流
         加入 Timeout 防止爬蟲卡死整晚。
         """
-        global _consecutive_failures
+        global _consecutive_failures, _current_cooldown
         current_cookies = sess.cookies.get_dict() if sess else {}
         
         for attempt in range(max_retries):
@@ -320,6 +331,7 @@ class PdfDownloader:
                 )
                 r2.raise_for_status()
                 _consecutive_failures = 0
+                _current_cooldown = _BASE_COOLDOWN_SECONDS
             except Exception as e:
                 logger.error(f"  ✗ step=9 請求失敗（{filename}）嘗試 {attempt+1}/{max_retries}：{e}")
                 _consecutive_failures += 1
@@ -338,8 +350,9 @@ class PdfDownloader:
                 logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
                 _consecutive_failures += 1
                 if attempt < max_retries - 1:
-                    logger.info("  偵測到 TWSE 暫時拒絕服務，主動休眠 5 分鐘後重試...")
-                    time.sleep(300)
+                    delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
+                    logger.info(f"  等待 {delay:.1f} 秒後重試...")
+                    time.sleep(delay)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
                         current_cookies = new_sess.cookies.get_dict()
@@ -389,6 +402,7 @@ class PdfDownloader:
 
                 logger.info(f"  ✓ 下載完成（{size_kb:.0f} KB）：{save_path}")
                 _consecutive_failures = 0
+                _current_cooldown = _BASE_COOLDOWN_SECONDS
                 return True
 
             except Exception as e:
