@@ -338,9 +338,8 @@ class PdfDownloader:
                 logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
                 _consecutive_failures += 1
                 if attempt < max_retries - 1:
-                    delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
-                    logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                    time.sleep(delay)
+                    logger.info("  偵測到 TWSE 暫時拒絕服務，主動休眠 5 分鐘後重試...")
+                    time.sleep(300)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
                         current_cookies = new_sess.cookies.get_dict()
