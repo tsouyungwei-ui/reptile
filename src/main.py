@@ -54,37 +54,33 @@ REPORT_TYPE = 'full_pdf'
 
 # ── 計算可查詢的最新季度 ──────────────────────────────────────────
 
-def get_latest_available_season(current_month: int) -> int:
-    """
-    根據當前月份，推算 MOPS 上最新可查的季度。
-    Q1 約 5 月公告、Q2 約 8 月、Q3 約 11 月、Q4 約隔年 3 月。
-    """
-    if 1 <= current_month <= 4:
-        return 3  # 去年 Q3（年報 Q4 可能也可查）
-    elif 5 <= current_month <= 7:
-        return 1
-    elif 8 <= current_month <= 10:
-        return 2
-    else:
-        return 3
-
-
 def build_quarter_list(start_year: int, end_year: int) -> list[tuple[int, int]]:
     """
     建立所有需要下載的 (ce_year, season) 清單，
     自動排除尚未到達的未來季度。
     """
     now = datetime.now()
-    current_year   = now.year
-    latest_season  = get_latest_available_season(now.month)
 
-    quarters = [
-        (y, s)
-        for y in range(start_year, end_year + 1)
-        for s in range(1, 5)
-        if not (y == current_year and s > latest_season)
-        and not (y > current_year)
-    ]
+    quarters = []
+    for y in range(start_year, end_year + 1):
+        for s in range(1, 5):
+            # 推算該財報公告的「合理最早公開月份」
+            # Q1 約 5 月公布、Q2 約 8 月、Q3 約 11 月、Q4 約隔年 3 月或 4 月
+            if s == 1:
+                pub_year, pub_month = y, 5
+            elif s == 2:
+                pub_year, pub_month = y, 8
+            elif s == 3:
+                pub_year, pub_month = y, 11
+            else: # s == 4
+                pub_year, pub_month = y + 1, 3
+            
+            # 如果目前的時間早於該財報的合理發表月份，就不產生該季度的檢查
+            if (now.year, now.month) < (pub_year, pub_month):
+                continue
+                
+            quarters.append((y, s))
+            
     return quarters
 
 
