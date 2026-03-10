@@ -157,20 +157,24 @@ def download_company(stock_id: str, start_year: int, end_year: int,
         f"共 {total} 個季度"
     )
 
-    # 建立該公司專用的 Session，讓所有季度共用同一個連線
-    company_session = PdfDownloader.get_initialized_session()
+    company_session = None
     requests_made = 0
 
     for i, (ce_year, season) in enumerate(quarters):
+        # 實體檔案優先判斷，避免提早初始化 session 導致誤算網路請求
+        save_path = PdfDownloader.get_save_path(stock_id, ce_year, season)
+        if not retry_failed and PdfDownloader.is_valid_file(save_path):
+            tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'DONE')
+            # 交給原來的 log 機制，或在這裡 debug 也可以
+            continue
+
+        # 遇到真的需要下載或查詢的季度，才初始化連線
+        if company_session is None:
+            company_session = PdfDownloader.get_initialized_session()
+
         result = download_quarter(stock_id, ce_year, season, market_type, tracker, retry_failed, session=company_session)
 
-        if result == 'downloaded':
-            # 這是唯一確認「可能有大量流量被送出」或「強制需要緩衝」的狀態
-            # 但我們可以把真正的等待判斷，全部交給「網路請求數量」
-            # 這裡就不再強制 time.sleep，交由最外層 run_all 的跨公司以及此處判斷
-            pass
-        elif result == 'skipped':
-            pass
+        # 'downloaded' 和 'skipped' 皆由 requests_diff 來判定是否需等待
         # 'noop' — 完全跳過，不需延遲
 
     # 清空這間公司的快取，避免佔用過多記憶體
