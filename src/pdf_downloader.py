@@ -27,6 +27,8 @@ import random
 import logging
 import requests
 import urllib3
+import time
+import concurrent.futures
 from bs4 import BeautifulSoup
 from . import config
 
@@ -34,6 +36,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 TWSE_DOC_URL = "https://doc.twse.com.tw/server-java/t57sb01"
+
+# 全域連鎖失敗計數器，用於觸發長期休眠
+_consecutive_failures = 0
+_MAX_CONSECUTIVE_FAILURES = 15
+_LONG_COOLDOWN_SECONDS = 600  # 10 分鐘
 
 
 def ce_to_roc(ce_year: int) -> int:
@@ -87,6 +94,65 @@ class PdfDownloader:
             "Referer": referer,
             "Connection": "close",  # 避免 TWSE 伺服器主動中斷 keep-alive 導致 BadStatusLine 錯誤
         }
+        
+    # ── 防卡死 (Hard Timeout) 網路請求 ─────────────────────────────────
+
+    @classmethod
+    def _safe_request(cls, method, url, max_time=30, **kwargs):
+        """
+        確保 requests 呼叫在 max_time 秒內必然返回或拋出 TimeoutError，
+        用於對付 WAF Tarpit (慢速滴漏攻擊) 所導致的無窮卡死問題。
+        """
+        def do_req():
+            if method.lower() == 'get':
+                return requests.get(url, **kwargs)
+            else:
+                return requests.post(url, **kwargs)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(do_req)
+            try:
+                # 設定硬時限
+                return future.result(timeout=max_time)
+            except concurrent.futures.TimeoutError:
+                # 超時後發出例外，主執行緒不再被綁架
+                raise TimeoutError(f"HTTP 請求強制逾時 (>{max_time}s) 疑似遭遇 Tarpit 限制")
+                
+    @classmethod
+    def _safe_download_stream(cls, url, save_path, max_time=60, **kwargs):
+        """
+        以串流方式安全下載檔案，具備整體最大耗時保證 (Hard Timeout)。
+        """
+        def do_download():
+            with requests.get(url, stream=True, **kwargs) as r:
+                r.raise_for_status()
+                ctype = r.headers.get('Content-Type', '')
+                if 'text/html' in ctype.lower():
+                    return "HTML" # 被擋，返回特殊標記
+                    
+                with open(save_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                return "SUCCESS"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(do_download)
+            try:
+                return future.result(timeout=max_time)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"下載串流強制逾時 (>{max_time}s)")
+
+
+    @classmethod
+    def _check_cooldown(cls):
+        """檢查是否達到連續失敗次數，觸發長時冷卻"""
+        global _consecutive_failures
+        if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+            logger.critical(f"偵測到連續 {_consecutive_failures} 次嚴重失敗，可能已遭 WAF 封鎖 IP！")
+            logger.critical(f"強制進入 {_LONG_COOLDOWN_SECONDS} 秒的深層休眠冷卻...")
+            time.sleep(_LONG_COOLDOWN_SECONDS)
+            _consecutive_failures = 0  # 醒來後歸零重試
+            logger.info("深層休眠結束，恢復爬蟲作業。")
 
     # ── Step 1：查詢可下載的 PDF 清單 ────────────────────────────
 
@@ -95,34 +161,17 @@ class PdfDownloader:
                          stock_id: str, roc_year: int, season: int, max_retries: int = 5) -> list[dict] | None:
         """
         從 TWSE 取得指定股票、年份、季度的 PDF 清單。
-        內部實作：首次查詢某股票時，送出不帶「年份」與「季度」的查詢，
-        取得該公司歷年所有財報檔案清單並快取，後續直接從快取過濾。
-
-        連結隱藏在 JavaScript onclick 裡：
-          readfile2("A","2330","202304_2330_AI1.pdf")
-        必須用 regex 解析，不能用 BeautifulSoup 的 find_all('a', href=...)。
-
-        回傳:
-          - [] 如果確實查無資料
-          - None 如果發生錯誤或被 WAF 阻擋
-          - [{...}, ...] 正常結果
         """
+        global _consecutive_failures
         stock_id_str = str(stock_id)
 
-        # 1) 如果快取已經是這間公司，且不是空陣列（或者已經確認查無任何資料），直接從快取過濾
+        # 1) 如果快取已經是這間公司，且不是空陣列，直接從快取過濾
         if cls._company_cache['stock_id'] == stock_id_str:
             cached_files = cls._company_cache['files']
             if not cached_files:
                 return []
                 
-            # 過濾出符合指定年份與季度的檔案
-            # 檔名格式通常如：202304_2330_AI1.pdf 或是 10803_2330_AI1.pdf 
-            # 前面代表 西元年+月份 或 民國年+月份。但保險起見，也可以不管完整名稱，只要確保包含年份與對應月份。
-            # 第一季：01~03（通常財報檔名是 01, 03, 05, etc 但 TWSE 慣例是用 01 代表 Q1, 02 代表 Q2, 03 代表 Q3, 04 代表 Q4）
-            # 新版格式如 202304, 舊版可能是 10204 等。
-            # 我們直接使用字串比對： {西元年}{對應季碼} 或 {民國年}{對應季碼}
             ce_year = roc_year + 1911
-            # 季碼通常會補零： '01', '02', '03', '04'
             target_postfix_ce  = f"{ce_year}{season:02d}_{stock_id_str}"
             target_postfix_roc = f"{roc_year}{season:02d}_{stock_id_str}"
             
@@ -144,37 +193,40 @@ class PdfDownloader:
             'mtype':    'A',
         }
         
-        current_sess = sess
+        current_cookies = sess.cookies.get_dict() if sess else {}
+        
         for attempt in range(max_retries):
+            cls._check_cooldown()
             try:
-                resp = current_sess.post(
+                resp = cls._safe_request(
+                    'post',
                     TWSE_DOC_URL,
                     data=data,
                     headers=cls._headers(),
-                    timeout=20,
+                    cookies=current_cookies,
+                    timeout=20,     # requests 的 recv timeout
+                    max_time=35,    # Hard timeout，35秒強切
                     verify=False,
                 )
                 resp.raise_for_status()
+                _consecutive_failures = 0 # 成功則歸零
+                
             except Exception as e:
                 logger.error(f"  ✗ 查詢失敗（{stock_id_str} 歷年資料）嘗試 {attempt+1}/{max_retries}：{e}")
+                _consecutive_failures += 1
                 if attempt < max_retries - 1:
-                    # 指數退避：10, 20, 40, ... 加上擾動
                     delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                     logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                    import time
                     time.sleep(delay)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
-                        current_sess = new_sess
+                        current_cookies = new_sess.cookies.get_dict()
                 continue
 
-            # 解析 HTML（Big5 編碼）
             html = resp.content.decode('big5', errors='replace')
 
-            # 找「查無資料」
             if '查無所需資料' in html:
                 logger.debug(f"  [{stock_id_str}] TWSE 查無任何歷年資料")
-                # 快取空結果
                 cls._company_cache['stock_id'] = stock_id_str
                 cls._company_cache['files'] = []
                 return []
@@ -209,21 +261,18 @@ class PdfDownloader:
                 cls._company_cache['stock_id'] = stock_id_str
                 cls._company_cache['files'] = all_files
                 
-                # 遞迴過濾並回傳該年份季度的檔案
-                return cls._query_file_list(current_sess, stock_id, roc_year, season, max_retries)
+                return cls._query_file_list(sess, stock_id, roc_year, season, max_retries)
                 
-            # If no results and no '查無所需資料' found: WAF blocked
             logger.warning(f"  ✗ step=1 收到非預期回應（可能遭阻擋），嘗試 {attempt+1}/{max_retries}")
+            _consecutive_failures += 1
             if attempt < max_retries - 1:
                 delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                 logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                import time
                 time.sleep(delay)
                 new_sess = cls.get_initialized_session()
                 if new_sess:
-                    current_sess = new_sess
+                    current_cookies = new_sess.cookies.get_dict()
         
-        # Exceeded retries
         return None
 
     # ── Step 2：串流下載 PDF ──────────────────────────────────────
@@ -234,14 +283,15 @@ class PdfDownloader:
                        save_path: str, max_retries: int = 5) -> bool:
         """
         TWSE 三步下載流程：
-          Step 2: POST step=9  → 回傳 HTML（非 PDF），內含時間戳記 /pdf/... 連結
-          Step 3: GET  /pdf/.. → 實際的 PDF 串流
-
-        若任一步驟失敗，加入自動重試與強制重新建立 Session，避免因 WAF 阻擋（BadStatusLine）而立即失敗。
+          Step 2: POST step=9  → 回傳 HTML，內含臨時 /pdf/... 連結
+          Step 3: GET  /pdf/.. → PDF 串流
+        加入 Timeout 防止爬蟲卡死整晚。
         """
-        current_sess = sess
+        global _consecutive_failures
+        current_cookies = sess.cookies.get_dict() if sess else {}
         
         for attempt in range(max_retries):
+            cls._check_cooldown()
             # ── Step 2：觸發下載，取得臨時 PDF 連結 ─────────────────
             data = {
                 'step':     '9',
@@ -251,41 +301,42 @@ class PdfDownloader:
                 'filename': filename,
             }
             try:
-                r2 = current_sess.post(
+                r2 = cls._safe_request(
+                    'post',
                     TWSE_DOC_URL,
                     data=data,
                     headers=cls._headers(),
-                    timeout=30,
+                    cookies=current_cookies,
+                    timeout=20,
+                    max_time=35, # Hard Timeout 35s
                     verify=False,
                 )
                 r2.raise_for_status()
+                _consecutive_failures = 0
             except Exception as e:
                 logger.error(f"  ✗ step=9 請求失敗（{filename}）嘗試 {attempt+1}/{max_retries}：{e}")
+                _consecutive_failures += 1
                 if attempt < max_retries - 1:
                     delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                     logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                    import time
                     time.sleep(delay)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
-                        current_sess = new_sess
+                        current_cookies = new_sess.cookies.get_dict()
                 continue
 
-            # 解析回傳 HTML（Big5 編碼）中的臨時檔案路徑
-            # 強制要求路徑包含 /pdf/ ，避免抓到 <link href='/ppp.css'>
             html = r2.content.decode('big5', errors='replace')
             m = re.search(r"href='(/pdf/[^']+\.[a-zA-Z0-9]+)'", html)
             if not m:
                 logger.warning(f"  step=9 回應中找不到下載連結，filename={filename}")
-                logger.debug(f"  回應內容：{html[:200]}")
+                _consecutive_failures += 1
                 if attempt < max_retries - 1:
                     delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                     logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                    import time
                     time.sleep(delay)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
-                        current_sess = new_sess
+                        current_cookies = new_sess.cookies.get_dict()
                 continue
 
             file_path = m.group(1)
@@ -294,32 +345,28 @@ class PdfDownloader:
 
             # ── Step 3：GET 下載實際檔案串流 ────────────────────────
             try:
-                with current_sess.get(
+                # 設定最長下載容忍時間：原本通常只需5秒以內，我們設 75 秒 Hard Timeout 防卡死
+                result = cls._safe_download_stream(
                     file_url,
+                    save_path,
+                    max_time=75,
                     headers=cls._headers(referer=TWSE_DOC_URL),
-                    stream=True,
+                    cookies=current_cookies,
                     timeout=config.PDF_DOWNLOAD_TIMEOUT,
-                    verify=False,
-                ) as r3:
-                    r3.raise_for_status()
-
-                    # 確認非 HTML 錯誤頁（正常會是 application/pdf 或 application/msword 等）
-                    ctype = r3.headers.get('Content-Type', '')
-                    if 'text/html' in ctype.lower():
-                        logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效或被擋：{file_url}")
-                        if attempt < max_retries - 1:
-                            delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
-                            logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                            import time
-                            time.sleep(delay)
-                            new_sess = cls.get_initialized_session()
-                            if new_sess:
-                                current_sess = new_sess
-                        continue
-
-                    with open(save_path, 'wb') as f:
-                        for chunk in r3.iter_content(chunk_size=65536):
-                            f.write(chunk)
+                    verify=False
+                )
+                
+                if result == "HTML":
+                    logger.warning(f"  step=3 仍收到 HTML，可能臨時連結失效或被擋：{file_url}")
+                    _consecutive_failures += 1
+                    if attempt < max_retries - 1:
+                        delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
+                        logger.info(f"  等待 {delay:.1f} 秒後重試...")
+                        time.sleep(delay)
+                        new_sess = cls.get_initialized_session()
+                        if new_sess:
+                            current_cookies = new_sess.cookies.get_dict()
+                    continue
 
                 size_kb = os.path.getsize(save_path) / 1024
                 if size_kb < 50:
@@ -328,32 +375,28 @@ class PdfDownloader:
                     if attempt < max_retries - 1:
                         delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                         logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                        import time
                         time.sleep(delay)
                         new_sess = cls.get_initialized_session()
                         if new_sess:
-                            current_sess = new_sess
+                            current_cookies = new_sess.cookies.get_dict()
                     continue
 
                 logger.info(f"  ✓ 下載完成（{size_kb:.0f} KB）：{save_path}")
-                
-                # 如果在這個過程中成功更換了 session，我們需要把修改過的 session 寫回去 (如果外層有關心)
-                # 這裡不特別依賴外部存取，因為通常下一季會重新呼叫 download() 但共用 session
-                # 為了更好的封裝性，我們其實只在此 function 內用 current_sess
+                _consecutive_failures = 0
                 return True
 
             except Exception as e:
                 logger.error(f"  ✗ 檔案 GET 失敗（{file_url}）嘗試 {attempt+1}/{max_retries}：{e}")
+                _consecutive_failures += 1
                 if os.path.exists(save_path):
                     os.remove(save_path)
                 if attempt < max_retries - 1:
                     delay = min(10 * (2 ** attempt) + random.uniform(1, 5), 120)
                     logger.info(f"  等待 {delay:.1f} 秒後重試...")
-                    import time
                     time.sleep(delay)
                     new_sess = cls.get_initialized_session()
                     if new_sess:
-                        current_sess = new_sess
+                        current_cookies = new_sess.cookies.get_dict()
                 continue
             
         return False
@@ -362,10 +405,28 @@ class PdfDownloader:
 
     @classmethod
     def get_initialized_session(cls) -> requests.Session | None:
-        """建立並初始化一個 Session（取得合法的初始 Cookie）"""
+        """建立並初始化一個 Session（取得合法的初始 Cookie），受冷卻與逾時保護"""
         sess = requests.Session()
         try:
-            sess.get(TWSE_DOC_URL, headers=cls._headers(), timeout=10, verify=False)
+            # 同樣包上一層安全網防卡死
+            cls._safe_request(
+                'get',
+                TWSE_DOC_URL,
+                max_time=25,
+                timeout=10,
+                headers=cls._headers(),
+                verify=False
+            )
+            # 將 Cookie 手動綁入 sess 中 (雖然 safe_request 每次起新請求，但 session 可被延續)
+            response_cookies = cls._safe_request(
+                 'get',
+                 TWSE_DOC_URL,
+                 max_time=25,
+                 timeout=10,
+                 headers=cls._headers(),
+                 verify=False
+            )
+            sess.cookies.update(response_cookies.cookies)
             return sess
         except Exception as e:
             logger.error(f"  初始化 Session 失敗：{e}")
@@ -382,17 +443,6 @@ class PdfDownloader:
 
         優先下載中文合併財報（AI1），其次個體財報（AI3），
         最後接受任何其他財報格式。
-
-        Args:
-            stock_id:    股票代號（如 '2330'）
-            ce_year:     西元年（如 2023）
-            season:      季度 1~4
-            market_type: 目前未使用（TWSE 不分市場類型），保留供擴充
-
-        Returns:
-            - str  : 成功，回傳檔案儲存路徑
-            - None : TWSE 查無此季度資料（公司尚未上市或無存檔）
-            - False: 下載過程失敗（網路錯誤、Session 初始化失敗、所有 retry 用盡）
         """
         roc_year  = ce_to_roc(ce_year)
 
@@ -409,36 +459,31 @@ class PdfDownloader:
             f"  [{stock_id}] {ce_year}年Q{season}（民國{roc_year}年第{season}季）"
         )
 
-        # 使用傳入的 Session，或建立獨立 Session（先訪問首頁取得合法 Cookie）
         if session is not None:
             sess = session
         else:
             sess = cls.get_initialized_session()
             if sess is None:
-                # Session 初始化失敗屬於「下載失敗」，非「查無資料」
                 return False
 
         # ── 查詢可下載的 PDF 清單 ─────────────────────────────────
         files = cls._query_file_list(sess, stock_id, roc_year, season)
 
         if files is None:
-            # 查詢過程失敗 (例如被 WAF 阻擋或發生 Exception)，回傳 False 讓上層標記為 FAILED
             logger.error(f"  [{stock_id}] {ce_year}Q{season} 查詢檔案清單失敗")
             return False
 
         if not files:
-            # 正常查詢但確實無資料 (回傳 [])
             return None
 
         logger.debug(f"  找到 {len(files)} 個檔案：{[f['filename'] for f in files]}")
 
         # ── 選擇優先下載的檔案 ────────────────────────────────────
-        # 優先順序：AI1（合併中文）> AI3（個體中文）> 其他
         def priority(f):
             n = f['filename'].upper()
-            if 'AI1' in n:  return 0   # IFRSs合併財報（最完整）
+            if 'AI1' in n:  return 0   # IFRSs合併財報
             if 'AI3' in n:  return 1   # IFRSs個體財報
-            if 'AIA' in n:  return 2   # 英文合併版（跳過優先）
+            if 'AIA' in n:  return 2   # 英文合併版
             return 3
 
         files_sorted = sorted(files, key=priority)
@@ -448,7 +493,6 @@ class PdfDownloader:
             fn = file_info['filename']
             desc = file_info.get('desc', '')
             
-            # 從檔名決定副檔名 (若無則預設 pdf)
             ext = fn.split('.')[-1].lower() if '.' in fn else 'pdf'
             save_path = cls.get_save_path(stock_id, ce_year, season, ext)
             
@@ -463,6 +507,5 @@ class PdfDownloader:
             ):
                 return save_path
 
-        # 有找到檔案清單，但所有連結都下載失敗 → 屬於「下載失敗」
         logger.error(f"  [{stock_id}] {ce_year}Q{season} 全部下載連結失敗")
         return False
