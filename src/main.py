@@ -133,17 +133,12 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
 
 def download_company(stock_id: str, start_year: int, end_year: int,
                      market_type: str, tracker: ProgressTracker,
-                     retry_failed: bool = False) -> int:
+                     retry_failed: bool = False, session: requests.Session = None) -> int:
     """
     下載單一公司在指定年份區間的所有季度財報 PDF。
 
     回傳:
-      requests_made (int): 實際發送了幾次請求（包含成功與查無資料）。
-      
-    延遲策略：
-      - 跨季請求：因為 Session 重用，使用 INTRA_COMPANY 較短延遲
-      - 查無資料（SKIPPED）：極短延遲
-      - 完全跳過（noop）：不等待
+      files_downloaded (int): 實際嘗試下載檔案的數量。
     """
     quarters = build_quarter_list(start_year, end_year)
     total    = len(quarters)
@@ -153,8 +148,8 @@ def download_company(stock_id: str, start_year: int, end_year: int,
         f"共 {total} 個季度"
     )
 
-    company_session = None
-    requests_made = 0
+    company_session = session
+    files_downloaded = 0
 
     for i, (ce_year, season) in enumerate(quarters):
         # 實體檔案優先判斷，避免提早初始化 session 導致誤算網路請求
@@ -169,15 +164,14 @@ def download_company(stock_id: str, start_year: int, end_year: int,
             company_session = PdfDownloader.get_initialized_session()
 
         result = download_quarter(stock_id, ce_year, season, market_type, tracker, retry_failed, session=company_session)
-
-        # 'downloaded' 和 'skipped' 皆由 requests_diff 來判定是否需等待
-        # 'noop' — 完全跳過，不需延遲
+        if result == 'downloaded':
+            files_downloaded += 1
 
     # 清空這間公司的快取，避免佔用過多記憶體
     PdfDownloader.clear_cache()
 
     logger.info(f"  [{stock_id}] 完成，共 {total} 季。")
-    return requests_made
+    return files_downloaded
 
 
 # ── 批量下載所有公司 ──────────────────────────────────────────────
@@ -204,6 +198,8 @@ def run_all(stock_df: pd.DataFrame, end_year: int,
         stock_df = stock_df.head(limit)
         logger.info(f"測試模式：只下載前 {limit} 間公司")
 
+    global_session = PdfDownloader.get_initialized_session()
+
     total = len(stock_df)
     for idx, row in enumerate(stock_df.itertuples(), start=1):
         stock_id    = str(row.stock_id).strip()
@@ -228,17 +224,21 @@ def run_all(stock_df: pd.DataFrame, end_year: int,
         )
 
         initial_requests = PdfDownloader.network_requests_this_session
-        requests_made = download_company(
+        files_downloaded = download_company(
             stock_id, start_year, end_year,
-            market_type, tracker, retry_failed
+            market_type, tracker, retry_failed, session=global_session
         )
         final_requests = PdfDownloader.network_requests_this_session
         requests_diff = final_requests - initial_requests
 
         # 若該公司有「實質發送網路請求」，且尚未到達最後一間公司，則進行跨公司長假等待
         if requests_diff > 0 and idx < total:
-            delay = random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY)
-            logger.info(f"  [防封鎖] 處理此公司送出了 {requests_diff} 次網路請求，長間隔等待 {delay:.1f} 秒...")
+            if files_downloaded > 0:
+                delay = random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY)
+                logger.info(f"  [防封鎖] 處理此公司送出了 {requests_diff} 次網路請求並下載了 {files_downloaded} 份檔案，長間隔等待 {delay:.1f} 秒...")
+            else:
+                delay = random.uniform(1.0, 2.5)
+                logger.info(f"  [防封鎖] 處理此公司送出了 {requests_diff} 次網路請求 (僅查詢無新檔)，短間隔等待 {delay:.1f} 秒...")
             time.sleep(delay)
         elif idx < total:
             logger.debug(f"  [極速路過] {stock_id} 已完整下載 (0 網路請求)，0 秒跳過！")
