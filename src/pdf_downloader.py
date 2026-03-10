@@ -54,6 +54,7 @@ class PdfDownloader:
     # 用於暫存某間公司歷年所有財報清單的快取，避免每季發送查詢請求
     _company_cache = {
         'stock_id': None,
+        'fetched': False,
         'files': []
     }
     
@@ -65,6 +66,7 @@ class PdfDownloader:
         """清空當前公司的檔案清單快取"""
         cls._company_cache = {
             'stock_id': None,
+            'fetched': False,
             'files': []
         }
 
@@ -170,11 +172,9 @@ class PdfDownloader:
         global _consecutive_failures
         stock_id_str = str(stock_id)
 
-        # 1) 如果快取已經是這間公司，且不是空陣列，直接從快取過濾
-        if cls._company_cache['stock_id'] == stock_id_str:
+        # 1) 如果快取已經是這間公司且已查詢過，直接從快取過濾
+        if cls._company_cache['stock_id'] == stock_id_str and cls._company_cache['fetched']:
             cached_files = cls._company_cache['files']
-            if not cached_files:
-                return []
                 
             ce_year = roc_year + 1911
             target_postfix_ce  = f"{ce_year}{season:02d}_{stock_id_str}"
@@ -233,6 +233,7 @@ class PdfDownloader:
             if '查無所需資料' in html:
                 logger.debug(f"  [{stock_id_str}] TWSE 查無任何歷年資料")
                 cls._company_cache['stock_id'] = stock_id_str
+                cls._company_cache['fetched'] = True
                 cls._company_cache['files'] = []
                 return []
 
@@ -264,6 +265,7 @@ class PdfDownloader:
             if all_files:
                 logger.debug(f"  [{stock_id_str}] 成功載入 {len(all_files)} 筆歷史財報清單並寫入快取")
                 cls._company_cache['stock_id'] = stock_id_str
+                cls._company_cache['fetched'] = True
                 cls._company_cache['files'] = all_files
                 
                 return cls._query_file_list(sess, stock_id, roc_year, season, max_retries)
