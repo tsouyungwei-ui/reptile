@@ -101,16 +101,14 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
       'skipped'    — 發了請求但查無資料
       'downloaded' — 有實際下載動作（成功或失敗）
     """
-    # ── 斷點續爬判斷 ──────────────────────────────────────────
-    if tracker.is_done(stock_id, ce_year, season, REPORT_TYPE):
-        # 即使標記為 DONE，仍需檢查實體檔案是否存在且有效
-        # 假設 PDF 檔案名稱結尾為 .pdf (PdfDownloader.download 會檢查更精確的路徑，此處我們做基本防呆)
-        save_path = PdfDownloader.get_save_path(stock_id, ce_year, season)
-        if PdfDownloader.is_valid_file(save_path):
-            logger.debug(f"  SKIP(DONE): {stock_id} {ce_year}Q{season}")
-            return 'noop'
-        else:
-            logger.info(f"  RETRY(MISSING): {stock_id} {ce_year}Q{season} 標記為 DONE 但檔案不存在或過小")
+    # ── 實體檔案優先判斷 (0秒閃過) ─────────────────────────
+    # 只要檔案確實存在且大小正常，就完全跳過，不再受制於 DB 紀錄
+    save_path = PdfDownloader.get_save_path(stock_id, ce_year, season)
+    if PdfDownloader.is_valid_file(save_path):
+        # 幫忙補上 DB 紀錄，以防之後需要
+        tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'DONE')
+        logger.debug(f"  SKIP(EXIST): {stock_id} {ce_year}Q{season}")
+        return 'noop'
 
     # ── 實際下載 ──────────────────────────────────────────────
     result = PdfDownloader.download(stock_id, ce_year, season, market_type, session=session)
@@ -120,7 +118,12 @@ def download_quarter(stock_id: str, ce_year: int, season: int,
         return 'downloaded'
     elif result is None:  # None → TWSE 查無資料（公司尚未上市或無存檔）
         tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'SKIPPED')
-        return 'skipped'
+        
+        # 判斷是否這是「零請求路過」(例如剛好命中 cache)
+        # 如果是命中 cache，PdfDownloader.download 會幾乎瞬間返回且不再發網路請求
+        # 這裡我們回傳 'noop'，讓上層迴圈不要浪費 time.sleep 去等待
+        logger.debug(f"  SKIP(NO_DATA): {stock_id} {ce_year}Q{season} (查無資料)")
+        return 'noop'
     else:                 # False → 下載失敗（網路錯誤、所有 retry 用盡）
         tracker.mark(stock_id, ce_year, season, REPORT_TYPE, 'FAILED')
         logger.warning(
@@ -162,17 +165,12 @@ def download_company(stock_id: str, start_year: int, end_year: int,
         result = download_quarter(stock_id, ce_year, season, market_type, tracker, retry_failed, session=company_session)
 
         if result == 'downloaded':
-            requests_made += 1
-            # 實際發請求 → 同公司跨季延遲 (較短)
-            delay = random.uniform(config.INTRA_COMPANY_MIN_DELAY, config.INTRA_COMPANY_MAX_DELAY)
-            logger.debug(f"  下載完成，同公司跨季等待 {delay:.1f} 秒...")
-            time.sleep(delay)
+            # 這是唯一確認「可能有大量流量被送出」或「強制需要緩衝」的狀態
+            # 但我們可以把真正的等待判斷，全部交給「網路請求數量」
+            # 這裡就不再強制 time.sleep，交由最外層 run_all 的跨公司以及此處判斷
+            pass
         elif result == 'skipped':
-            requests_made += 1
-            # 發了請求但查無資料 → 短暫緩衝
-            delay = random.uniform(config.SKIP_MIN_DELAY, config.SKIP_MAX_DELAY)
-            logger.debug(f"  查無資料，短暫等待 {delay:.1f} 秒...")
-            time.sleep(delay)
+            pass
         # 'noop' — 完全跳過，不需延遲
 
     # 清空這間公司的快取，避免佔用過多記憶體
@@ -229,16 +227,21 @@ def run_all(stock_df: pd.DataFrame, end_year: int,
             f"{'='*60}"
         )
 
+        initial_requests = PdfDownloader.network_requests_this_session
         requests_made = download_company(
             stock_id, start_year, end_year,
             market_type, tracker, retry_failed
         )
+        final_requests = PdfDownloader.network_requests_this_session
+        requests_diff = final_requests - initial_requests
 
-        # 若該公司有實際發送請求，且尚未到達最後一間公司，則進行跨公司長假等待
-        if requests_made > 0 and idx < total:
+        # 若該公司有「實質發送網路請求」，且尚未到達最後一間公司，則進行跨公司長假等待
+        if requests_diff > 0 and idx < total:
             delay = random.uniform(config.INTER_COMPANY_MIN_DELAY, config.INTER_COMPANY_MAX_DELAY)
-            logger.info(f"  切換公司，長間隔等待 {delay:.1f} 秒...")
+            logger.info(f"  [防封鎖] 處理此公司送出了 {requests_diff} 次網路請求，長間隔等待 {delay:.1f} 秒...")
             time.sleep(delay)
+        elif idx < total:
+            logger.debug(f"  [極速路過] {stock_id} 已完整下載 (0 網路請求)，0 秒跳過！")
 
     tracker.print_summary()
     logger.info("全部公司下載作業完成！")

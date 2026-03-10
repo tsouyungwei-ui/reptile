@@ -56,6 +56,9 @@ class PdfDownloader:
         'stock_id': None,
         'files': []
     }
+    
+    # 精準記錄真實的網路封包請求數量，以決定是否需要長時間的防封鎖等待
+    network_requests_this_session = 0
 
     @classmethod
     def clear_cache(cls):
@@ -104,6 +107,7 @@ class PdfDownloader:
         用於對付 WAF Tarpit (慢速滴漏攻擊) 所導致的無窮卡死問題。
         """
         def do_req():
+            cls.network_requests_this_session += 1
             if method.lower() == 'get':
                 return requests.get(url, **kwargs)
             else:
@@ -124,6 +128,7 @@ class PdfDownloader:
         以串流方式安全下載檔案，具備整體最大耗時保證 (Hard Timeout)。
         """
         def do_download():
+            cls.network_requests_this_session += 1
             with requests.get(url, stream=True, **kwargs) as r:
                 r.raise_for_status()
                 ctype = r.headers.get('Content-Type', '')
